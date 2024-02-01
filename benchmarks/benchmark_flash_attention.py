@@ -15,6 +15,8 @@ from flash_attn import flash_attn_qkvpacked_func
 
 try:
     from triton.ops.flash_attention import attention as attention_triton
+    from flash_attn.flash_attn_triton_latest import attention as attention_triton
+    from relax.flash_self_attn_swap import attention as self_attn_swap_triton
 except ImportError:
     attention_triton = None
 
@@ -62,6 +64,10 @@ def attention_pytorch(qkv, dropout_p=0.0, causal=True):
     return output.to(dtype=qkv.dtype)
 
 
+def time_fwd(func, *args, **kwargs):
+    time_f = benchmark_forward(func, *args, **kwargs)
+    return time_f[1].mean
+
 def time_fwd_bwd(func, *args, **kwargs):
     time_f, time_b = benchmark_fwd_bwd(func, *args, **kwargs)
     return time_f[1].mean, time_b[1].mean
@@ -72,13 +78,16 @@ device = 'cuda'
 dtype = torch.float16
 
 bs_seqlen_vals = [(32, 512), (16, 1024), (8, 2048), (4, 4096), (2, 8192), (1, 16384)]
+bs_seqlen_vals = [(4, 16384)]
 causal_vals = [False, True]
-headdim_vals = [64, 128]
+causal_vals = [False]
+headdim_vals = [32]
 dim = 2048
 dropout_p = 0.0
 
 methods = (["Flash2", "Pytorch"]
            + (["Triton"] if attention_triton is not None else [])
+           + (["TritonSwap"] if self_attn_swap_triton is not None else [])
            + (["xformers.c"] if xops is not None else [])
            + (["xformers.f"] if xops is not None else []))
 
@@ -131,6 +140,20 @@ for causal in causal_vals:
                     b0 = float('inf')
                 time_f[config, "Triton"] = f
                 time_b[config, "Triton"] = min(b, b0) if min(b, b0) < float('inf') else float('nan')
+
+            if self_attn_swap_triton is not None:
+                q, k, v = [torch.randn(batch_size, nheads, seqlen if i == 0 else seqlen + 256, headdim, device=device, dtype=dtype,
+                                    requires_grad=True) for i in range(3)]
+                # Try both values of sequence_parallel and pick the faster one
+                pad = torch.zeros(batch_size, device=q.device, dtype=torch.int32)
+                pad[:] = 90
+                f = time_fwd(
+                    self_attn_swap_triton, q, k, v, headdim**(-0.5), pad,
+                    repeats=repeats, verbose=False
+                )
+                time_f[config, "TritonSwap"] = f
+                time_b[config, "TritonSwap"] = float('nan')
+
 
             if xops is not None:
                 q, k, v = [torch.randn(batch_size, seqlen, nheads, headdim, device=device, dtype=dtype,
